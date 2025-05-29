@@ -1,0 +1,409 @@
+#pragma kernel Step1
+#pragma kernel Step2
+#pragma kernel Step3
+#pragma kernel SolveInOneKernel
+
+#define INV_PI 0.31831
+#define THREAD_COUNT 1024
+#define _EPSILON 1e-3
+#define MAX_NEIGHBOR_COUNT 50
+#define MAX_SOLVE_ITER 5
+
+uniform uint ParticleSum;
+uniform uint GridSum;
+uniform uint BlockNum;
+uniform float DeltaT;
+uniform float InvDeltaT;
+uniform float Radius;
+uniform float SmoothKernelRadius;
+uniform float StaticDensity;
+uniform float CubeGridEdgeLen;
+uniform float SoftConstrainCoef;
+uniform float ScorrCoefP;
+uniform float ScorrCoefK;
+uniform int ScorrCoefN;
+uniform float XSPHCoef;
+uniform uint3 GridSize;
+uniform float3 ExternForce;
+uniform float3 BoundaryBoxDiagonalMin;
+uniform float3 BoundaryBoxDiagonalMax;
+
+struct GridCounter
+{
+    uint Count;
+    uint Iter;
+};
+
+RWStructuredBuffer<uint> _PrefixSum;
+RWStructuredBuffer<uint> _IxInGrid;
+RWStructuredBuffer<uint> _CountNeighbor;
+RWStructuredBuffer<uint> _IxNeighbor;
+RWStructuredBuffer<float> _Lambda;
+RWStructuredBuffer<float3> _Velocity;
+RWStructuredBuffer<float3> _VelocityXSPH;
+RWStructuredBuffer<float3> _Position;
+RWStructuredBuffer<float3> _PredictPosition;
+RWStructuredBuffer<GridCounter> _CountGrid;
+
+float3 ConfinedBoundary(in float3 p);
+float3 Spiky(float3 r, float h);
+float Poly6(float3 r, float h);
+
+[numthreads(THREAD_COUNT, 1, 1)]
+void Step1(uint3 id : SV_DispatchThreadID)
+{
+    //Step01: predict position.
+    uint particleId = id.x;
+    while (particleId < ParticleSum)
+    {
+		//_Velocity[id.x] += TimeInterval * ExternForce / PARTICLE_MASS;
+        _Velocity[particleId] += DeltaT * ExternForce;
+        _PredictPosition[particleId] = _Position[particleId] + DeltaT * _Velocity[particleId];
+        _PredictPosition[particleId] = ConfinedBoundary(_PredictPosition[particleId]);
+    
+        particleId += BlockNum * THREAD_COUNT;
+    }
+    AllMemoryBarrierWithGroupSync();
+    
+    // Step02.1: init grid counter.
+    uint gridId = id.x;
+    while (gridId < GridSum)
+    {
+        _CountGrid[gridId].Iter = 0;
+        _CountGrid[gridId].Count = 0;
+        
+        gridId += BlockNum * THREAD_COUNT;
+    }
+    
+    AllMemoryBarrierWithGroupSync();
+    
+    // Step02.2: calc grid count.
+    particleId = id.x;
+    while (particleId < ParticleSum)
+    {
+        int xCount;
+        int yCount;
+        int zCount;
+
+        float3 particlePos = _PredictPosition[particleId];
+        xCount = (int) floor((particlePos.x - BoundaryBoxDiagonalMin.x) / CubeGridEdgeLen);
+        yCount = (int) floor((particlePos.y - BoundaryBoxDiagonalMin.y) / CubeGridEdgeLen);
+        zCount = (int) floor((particlePos.z - BoundaryBoxDiagonalMin.z) / CubeGridEdgeLen);
+
+        int gridId = xCount + yCount * GridSize.x + zCount * GridSize.x * GridSize.y;
+
+        if (0 <= gridId && gridId < GridSum)
+            InterlockedAdd(_CountGrid[gridId].Count, 1);
+        particleId += BlockNum * THREAD_COUNT;
+
+    }
+    AllMemoryBarrierWithGroupSync();
+    
+    // Step02.3: init grid prefix.
+    gridId = id.x;
+    while (gridId < GridSum)
+    {
+        _PrefixSum[gridId] = _CountGrid[gridId].Count;
+        gridId += BlockNum * THREAD_COUNT;
+    }
+}
+
+[numthreads(THREAD_COUNT, 1, 1)]
+void Step2(uint3 id : SV_DispatchThreadID)
+{
+    uint gridId = id.x;
+    
+    // Step02.4: calc grid prefix
+    uint groupSize = 2; // per execute represent per groupSize's grid particle sum has been calc 
+    uint unitSize = 1;
+    bool isFirst = true;
+    do
+    {
+        groupSize *= 2;
+        unitSize *= 2;
+		// bug01: remember to reset id for next group
+        gridId = id.x;
+
+        if (isFirst)
+        {
+            groupSize = 2;
+            unitSize = 1;
+            isFirst = false;
+        }
+
+        while (gridId < GridSum)
+        {
+			// odd divide 2 equal 1
+            uint oddEvenFlag = (gridId / unitSize) % 2;
+
+            if (oddEvenFlag == 1)
+            {
+                uint unitIx = gridId / unitSize;
+				// add previous group sum
+                uint previousUnitLastValue = _PrefixSum[unitIx * unitSize - 1];
+
+                _PrefixSum[gridId] += previousUnitLastValue;
+            }
+
+            gridId += BlockNum * THREAD_COUNT;
+        }
+
+        AllMemoryBarrierWithGroupSync();
+    } while (groupSize < GridSum);
+}
+
+[numthreads(THREAD_COUNT, 1, 1)]
+void Step3(uint3 id : SV_DispatchThreadID)
+{
+    // Step02.5: particle enter grid
+    uint particleId = id.x;
+    while (particleId < ParticleSum)
+    {
+        int xCount;
+        int yCount;
+        int zCount;
+
+        float3 particlePos = _PredictPosition[particleId];
+        xCount = (int) floor((particlePos.x - BoundaryBoxDiagonalMin.x) / CubeGridEdgeLen);
+        yCount = (int) floor((particlePos.y - BoundaryBoxDiagonalMin.y) / CubeGridEdgeLen);
+        zCount = (int) floor((particlePos.z - BoundaryBoxDiagonalMin.z) / CubeGridEdgeLen);
+
+        int gridId = xCount + yCount * GridSize.x + zCount * GridSize.x * GridSize.y;
+        int iter;
+        
+        if (gridId < GridSum)
+        {
+            // read lock and write lock maybe conflict. So use third argument 'iter' to save correct value;
+            InterlockedAdd(_CountGrid[gridId].Iter, 1, iter);
+		    // save ix;
+            _IxInGrid[_PrefixSum[gridId] - iter - 1] = particleId;
+        }
+        
+        particleId += BlockNum * THREAD_COUNT;
+    }
+    
+    AllMemoryBarrierWithGroupSync();
+    
+    // step02.6: find neighbor
+    particleId = id.x;
+    while (particleId < ParticleSum)
+    {
+        int xCount;
+        int yCount;
+        int zCount;
+
+        float3 particlePos = _PredictPosition[particleId];
+        xCount = (int) floor((particlePos.x - BoundaryBoxDiagonalMin.x) / CubeGridEdgeLen);
+        yCount = (int) floor((particlePos.y - BoundaryBoxDiagonalMin.y) / CubeGridEdgeLen);
+        zCount = (int) floor((particlePos.z - BoundaryBoxDiagonalMin.z) / CubeGridEdgeLen);
+
+        int gridId = xCount + yCount * GridSize.x + zCount * GridSize.x * GridSize.y;
+
+		// 3 * 3 grids to find neighbor
+        int xLeft = xCount - 1 < 0 ? 0 : xCount - 1;
+        int xRight = xCount + 1 > GridSize.x - 1 ? GridSize.x - 1 : xCount + 1;
+        int yLeft = yCount - 1 < 0 ? 0 : yCount - 1;
+        int yRight = yCount + 1 > GridSize.y - 1 ? GridSize.y - 1 : yCount + 1;
+        int zLeft = zCount - 1 < 0 ? 0 : zCount - 1;
+        int zRight = zCount + 1 > GridSize.z - 1 ? GridSize.z - 1 : zCount + 1;
+
+        int startIxInGrid;
+        for (int i = xLeft; i <= xRight; ++i)
+        {
+            for (int j = yLeft; j <= yRight; ++j)
+            {
+                for (int k = zLeft; k <= zRight; ++k)
+                {
+                    int gridId = i + j * GridSize.x + k * GridSize.x * GridSize.y;
+
+                    startIxInGrid = _PrefixSum[gridId] - _CountGrid[gridId].Count;
+                    for (int ix = startIxInGrid; ix < _PrefixSum[gridId]; ++ix)
+                    {
+                        if (_CountNeighbor[particleId] >= MAX_NEIGHBOR_COUNT)
+                        {
+                            break;
+                        }
+						
+						// neighbor is self
+                        uint neighborId = _IxInGrid[ix];
+                        if (particleId == neighborId)
+                        {
+                            continue;
+                        }
+						
+                        float3 neighborPos = _PredictPosition[neighborId];
+                        float3 selfPos = _PredictPosition[particleId];
+                        float3 deltaPos = selfPos - neighborPos;
+
+                        if (dot(deltaPos, deltaPos) < SmoothKernelRadius * SmoothKernelRadius)
+                        {
+                            uint neighborIx;
+							// Third argument is importance! Because atomic operation
+                            InterlockedAdd(_CountNeighbor[particleId], 1, neighborIx);
+                            _IxNeighbor[particleId * MAX_NEIGHBOR_COUNT + neighborIx] = neighborId;
+
+                        }
+                    }
+                }
+            }
+        }
+    
+        particleId += BlockNum * THREAD_COUNT;
+    }
+}
+
+[numthreads(THREAD_COUNT, 1, 1)]
+void SolveInOneKernel(uint3 id : SV_DispatchThreadID)
+{
+    int particleId;
+	//Step 3
+    for (int solveLoop = 0; solveLoop < MAX_SOLVE_ITER; solveLoop++)
+    {
+        particleId = id.x;
+        while (particleId < ParticleSum)
+        {
+			//Step 3.1: Lagrange
+            float numerator = 0;
+            float denominator = 0;
+
+            float numeratorTempSum = 0;
+            float3 denominatorTempSum = float3(0, 0, 0);
+            int i;
+
+            for (i = 0; i < _CountNeighbor[particleId]; i++)
+            {
+                float3 selfPosition = _PredictPosition[particleId];
+                int neighborId = _IxNeighbor[particleId * MAX_NEIGHBOR_COUNT + i];
+                float3 neighborPosition = _PredictPosition[neighborId];
+                float3 deltaPosition = selfPosition - neighborPosition;
+
+                float3 nablaC = Spiky(deltaPosition, SmoothKernelRadius) / StaticDensity;
+                denominatorTempSum += nablaC;
+                denominator += dot(nablaC, nablaC);
+
+                numeratorTempSum += Poly6(deltaPosition, SmoothKernelRadius);
+            }
+            numerator = numeratorTempSum / StaticDensity - 1;
+            denominator += dot(denominatorTempSum, denominatorTempSum);
+
+            _Lambda[particleId] = -numerator / (denominator + SoftConstrainCoef);
+
+            particleId += BlockNum * THREAD_COUNT;
+        }
+        AllMemoryBarrierWithGroupSync();
+        
+        particleId = id.x;
+        while (particleId < ParticleSum)
+        {
+			//Step 3.2: ConstraintSolve
+            float3 delta = float3(0, 0, 0);
+
+            float lambda_i = _Lambda[particleId];
+
+            for (int i = 0; i < _CountNeighbor[particleId]; i++)
+            {
+                float3 selfPosition = _PredictPosition[particleId];
+                int neighborId = _IxNeighbor[particleId * MAX_NEIGHBOR_COUNT + i];
+                float3 neighborPosition = _PredictPosition[neighborId];
+                float3 deltaPosition = selfPosition - neighborPosition;
+
+                float lambda_j = _Lambda[neighborId];
+
+                float scorr_term = 1 / pow(1 - ScorrCoefP * ScorrCoefP, 3) 
+                    * pow(1 - dot(deltaPosition, deltaPosition) / SmoothKernelRadius / SmoothKernelRadius, 3);
+                float scorr = -ScorrCoefK * pow(
+					max(scorr_term, 0)
+					, ScorrCoefN);
+
+                //delta += (lambda_i + lambda_j + scorr) * Spiky(deltaPosition, SmoothKernelRadius);
+                delta += (lambda_i + lambda_j) * Spiky(deltaPosition, SmoothKernelRadius);
+            }
+            
+            _PredictPosition[particleId] += delta / StaticDensity;
+            _PredictPosition[particleId] = ConfinedBoundary(_PredictPosition[particleId]);
+            
+            particleId += BlockNum * THREAD_COUNT;
+        }
+        AllMemoryBarrierWithGroupSync();
+    }
+    
+	//Step 4: 
+    particleId = id.x;
+    while (particleId < ParticleSum)
+    {
+		//Step 4.1: Final
+        _Velocity[particleId] = (_PredictPosition[particleId] - _Position[particleId]) * InvDeltaT;
+		//loop for another particle
+        particleId += BlockNum * THREAD_COUNT;
+    }
+    AllMemoryBarrierWithGroupSync();
+    
+    particleId = id.x;
+    while (particleId < ParticleSum)
+    {
+		//Step 4.2: XSPH
+        _VelocityXSPH[particleId] = _Velocity[particleId];
+        for (int i = 0; i < _CountNeighbor[particleId]; i++)
+        {
+            float3 selfPosition = _PredictPosition[particleId];
+            float3 selfVelocity = _Velocity[particleId];
+            int neighborId = _IxNeighbor[particleId * MAX_NEIGHBOR_COUNT + i];
+            float3 neighborPosition = _PredictPosition[neighborId];
+            float3 neighborVelocity = _Velocity[neighborId];
+            float3 deltaPosition = selfPosition - neighborPosition;
+            float3 deltaVelocity = selfVelocity - neighborVelocity;
+
+            _VelocityXSPH[particleId] -= XSPHCoef * deltaVelocity * Poly6(deltaPosition, SmoothKernelRadius) / StaticDensity;
+        }
+
+        particleId += BlockNum * THREAD_COUNT;
+    }
+    
+    AllMemoryBarrierWithGroupSync();
+    particleId = id.x;
+    while (particleId < ParticleSum)
+    {
+		//Step 4.3: Final2
+        _Velocity[particleId] = _VelocityXSPH[particleId];
+        _Position[particleId] = _PredictPosition[particleId];
+		//loop for another particle
+        particleId += BlockNum * THREAD_COUNT;
+    }
+}
+
+float Poly6(float3 r, float h)
+{
+    if (h < length(r))
+        return 0;
+    float constant = 315.0f / 64 * INV_PI / pow(h, 9);
+    return pow(h * h - dot(r, r), 3) * constant;
+}
+
+float3 Spiky(float3 r, float h)
+{
+    if (h < length(r))
+        return float3(0, 0, 0);
+    float constant = -45.0f * INV_PI / pow(h, 6);
+    return pow(h - length(r), 2) * constant * normalize(r);
+}
+
+float Random(in float2 uv)
+{
+    float2 noise = (frac(sin(dot(uv, float2(12.9898, 78.233) * 2.0)) * 43758.5453));
+    return abs(noise.x + noise.y) * 0.5;
+}
+
+float3 ConfinedBoundary(in float3 p)
+{
+    if (p.x - Radius < BoundaryBoxDiagonalMin.x)
+        p.x = BoundaryBoxDiagonalMin.x + Radius + _EPSILON * Random(p.yz);
+    if (p.x + Radius > BoundaryBoxDiagonalMax.x)
+        p.x = BoundaryBoxDiagonalMax.x - Radius - _EPSILON * Random(p.yz);
+    if (p.z - Radius < BoundaryBoxDiagonalMin.z)
+        p.z = BoundaryBoxDiagonalMin.z + Radius + _EPSILON * Random(p.xy);
+    if (p.z + Radius > BoundaryBoxDiagonalMax.z)
+        p.z = BoundaryBoxDiagonalMax.z - Radius - _EPSILON * Random(p.xy);
+    if (p.y - Radius < BoundaryBoxDiagonalMin.y)
+        p.y = BoundaryBoxDiagonalMin.y + Radius + _EPSILON * Random(p.xz);
+    return p;
+}
